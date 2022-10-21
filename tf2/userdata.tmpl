@@ -1,0 +1,167 @@
+#!/bin/bash 
+
+# Output information about what this script is doing.
+function info {
+  echo "startup-script: $@"
+}
+
+ucf --purge /boot/grub/menu.lst
+export DEBIAN_FRONTEND=noninteractive
+info Updating packages. . .
+apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" update
+apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade
+
+info Setting hostname to include the instance ID
+instance_id=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+hostnamectl set-hostname "${name_prefix}-$${instance_id}"
+
+
+apt-get install -y apt-transport-https curl ca-certificates curl software-properties-common lsb-release awscli
+
+# Install Docker CE
+info Installing Docker
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu  $(lsb_release -cs)  stable"
+apt-get update && apt-get install -y \
+  containerd.io \
+  docker-ce \
+  docker-ce-cli
+info Configuring docker daemon.json
+cat > /etc/docker/daemon.json <<EOF
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+mkdir -p /etc/systemd/system/docker.service.d
+systemctl daemon-reload
+systemctl restart docker
+systemctl enable docker
+
+
+info Configuring bridging
+cat <<EOF >>/etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+EOF
+sysctl --system
+
+info Installing other software
+apt-get update && apt-get install -y vim git curl unzip bash-completion pip
+
+info Installing ASDF
+git clone https://github.com/asdf-vm/asdf.git /usr/local/asdf --branch v0.9.0 && \
+  printf 'export ASDF_DATA_DIR=/usr/local/asdf\n. /usr/local/asdf/asdf.sh\n. /usr/local/asdf/completions/asdf.bash\n' >/etc/profile.d/asdf.sh
+source /etc/profile.d/asdf.sh
+cat <<EOF >/usr/local/asdf/tool-versions
+# A shared global ASDF .tool-versions file.
+# THis will be symlinked to individual ~/.tool-versions files.
+terraform 1.1.8
+kubectl 1.23.6
+helm 3.8.2
+direnv 2.29.0
+k6 0.37.0
+EOF
+chmod 644 /usr/local/asdf/tool-versions
+for n in /etc/skel /home/ubuntu /root
+do
+ln -s /usr/local/asdf/tool-versions $${n}/.tool-versions
+done
+for plugin in `cat /usr/local/asdf/tool-versions |egrep -v '\#' |awk '{print $1};'`
+do
+
+  info "Installing $plugin asdf plugin"
+  asdf plugin add $plugin
+done
+info "Installing asdf-managed tools"
+cd ~
+HOME=/root asdf install
+echo 'eval "$(direnv hook bash)"' >/etc/profile.d/direnv.sh
+
+info Installing kubectl completion and alias
+kubectl completion bash >/usr/share/bash-completion/completions/kubectl
+cp /usr/share/bash-completion/completions/kubectl /usr/share/bash-completion/completions/k
+perl -i -p -e 's/kubectl/k/g;' /usr/share/bash-completion/completions/k
+printf 'alias k=kubectl\n' >/etc/profile.d/kubectl.sh
+
+info Creating githubsudoers group and sudo configuration
+groupadd -r githubsudo
+echo '%githubsudo ALL=(ALL) NOPASSWD:ALL'>/etc/sudoers.d/githubsudo
+
+info Adding optional additional users and authorized_keys
+%{ for u in additional_users ~}
+    user_login=${lookup(u, "login")}
+    # If gecos is nset, default to the user-name.
+    user_gecos=${lookup(u,
+      "gecos",
+      lookup(u, "login"),
+    )}
+    # If shell is isn't set, default to bash.
+    user_shell=${lookup(u, "shell", "/bin/bash")}
+    user_supplemental_groups=${lookup(u, "supplemental_groups", "")}
+    user_authorized_keys="${lookup(u, "authorized_keys")}"
+info "Creating user:"
+printf "  Login: \"$${user_login}\"\n"
+
+#if [ "$${user_authorized_keys}x" == "x" ]; then
+#  info "authorized_keys are required, but were not provided - the above user will not be created."
+#else
+  useradd -s $${user_shell} -c "$${user_gecos}" -m $${user_login}
+  [ "$${user_supplemental_groups}x" != "x" ] && usermod -G $${user_supplemental_groups} $${user_login}
+  info "Populating authorized_keys for $${user_login}"
+  mkdir /home/$${user_login}/.ssh
+  cat <<EOF > /home/$${user_login}/.ssh/authorized_keys
+$${user_authorized_keys}
+EOF
+  chown -R $${user_login}:$${user_login} /home/$${user_login}/.ssh
+  chmod -R go= /home/$${user_login}/.ssh
+#fi
+%{ endfor ~}
+info Installing reckoner
+mkdir reckoner && cd reckoner && \
+curl -Lo ./reckoner.tar.gz https://github.com/FairwindsOps/reckoner/releases/download/v6.0.0-rc.4/reckoner_6.0.0-rc.4_linux_amd64.tar.gz && \
+tar -xzf reckoner.tar.gz && chmod +x reckoner && cp reckoner /usr/local/bin/ && \
+cd .. && rm -rf reckoner
+
+info Installing kind
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.12.0/kind-linux-amd64
+chmod +x ./kind
+mv ./kind /usr/local/bin/kind
+
+info Creating a cluster...
+kind create cluster
+info Waiting for the kind node to become ready
+kubectl wait -n kube-system --for=condition=ready node/kind-control-plane
+
+info Downloading content from S3 to /insights
+aws s3 sync s3://${exchange_bucket_name} /insights/
+
+info Preparing environment to run Reckoner
+export ASDF_HELM_VERSION=$(grep helm ~/.tool-versions|awk '{print $2};') # for reckoner
+export HOME=/root # For reckoner-run helm to find the kube config file
+cd /insights
+
+info Installing prerequisite helm charts. . .
+reckoner plot -a infra.yaml
+
+info COnfiguring direnv to set environment for future manual runs of install-agents.sh
+cat >/.envrc <<EOF
+export INSIGHTS_AGENT_VERSION=${insights_agent_version}
+export INSIGHTS_API_TOKEN="${insights_api_token}"
+export INSIGHTS_URL="${insights_url}"
+export INSIGHTS_ORG="${insights_org}"
+EOF
+direnv allow
+
+info Installing ${num_insights_agents} Insights agents. . .
+chmod +x install-agents.sh
+export INSIGHTS_AGENT_VERSION=${insights_agent_version}
+export INSIGHTS_API_TOKEN="${insights_api_token}"
+export INSIGHTS_URL="${insights_url}"
+export INSIGHTS_ORG="${insights_org}"
+./install-agents.sh ${num_insights_agents}
+
