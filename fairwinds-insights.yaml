@@ -1,0 +1,21 @@
+options:
+  organization: ivan-demo
+  setExitCode: false
+  #hostname: http://host.docker.internal:3000
+  #hostname: http://localhost:3000
+  repositoryName: ivanfetch-fw/testrepo5
+reports:
+  polaris:
+    enabled: false
+  trivy:
+    enabled: false
+  pluto:
+    enabled: false
+  opa:
+    enabled: false
+  tfsec:
+    enabled: true
+terraform:
+  paths:
+    - tf
+    - tf2
