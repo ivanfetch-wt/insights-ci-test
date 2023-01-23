@@ -3,7 +3,9 @@ options:
   setExitCode: false
   #hostname: http://host.docker.internal:3000
   #hostname: http://localhost:3000
-  repositoryName: ivanfetch-fw/testrepo5
+  hostname: https://staging.insights.fairwinds.com
+  repositoryName: ivanfetch-fw/insights-ci-test
+  baseBranch: main
 reports:
   polaris:
     enabled: false
@@ -13,9 +15,7 @@ reports:
     enabled: false
   opa:
     enabled: false
-  tfsec:
-    enabled: true
 terraform:
   paths:
     - tf
-    - tf2
+
